@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>آزمایش زاویه تنه با MediaPipe</title>
+<style>
+:root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Tahoma,sans-serif;color:#172033;background:#f4f6fa}
+*{box-sizing:border-box}body{margin:0;padding:16px;max-width:760px;margin-inline:auto}
+h1{font-size:21px;margin:8px 0}p{line-height:1.8;color:#46536a}
+.panel{background:white;border:1px solid #e1e6ef;border-radius:16px;padding:14px;margin:12px 0}
+#stage{position:relative;width:100%;background:#111;border-radius:12px;overflow:hidden;min-height:220px}
+video,canvas{display:block;width:100%;height:auto;transform:scaleX(-1)}
+canvas{position:absolute;inset:0}
+button{border:0;border-radius:12px;padding:13px 14px;font-size:15px;font-weight:650;background:#2457d6;color:white;min-height:46px}
+button.secondary{background:#e9eefb;color:#183b91}button:disabled{opacity:.45}
+.controls{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+.big{font-size:38px;font-weight:750;font-variant-numeric:tabular-nums}
+.muted{font-size:13px;color:#69758a}.status{font-size:14px;font-weight:600}
+label{display:block;margin:8px 0}
+input{font:inherit;padding:8px;border:1px solid #ccd4e2;border-radius:8px;width:100%}
+table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:8px;border-bottom:1px solid #e7ebf2;text-align:center}
+.note{font-size:12px;color:#68758b;line-height:1.8}
+</style>
+</head>
+<body>
+<h1>اندازه‌گیری آزمایشی زاویه تنه</h1>
+<p>آزمایش اولیه با دوربین آیفون و MediaPipe. گوشی را ثابت، از نمای جانبی و طوری قرار دهید که تمام بدن دیده شود.</p>
+
+<div class="panel">
+  <div id="stage">
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+  <p id="status" class="status">برای شروع، اجازه دسترسی به دوربین را بدهید.</p>
+  <div class="big"><span id="angle">—</span><span style="font-size:17px">°</span></div>
+  <div class="muted" id="quality">زاویه تنه نسبت به راستای عمودی</div>
+</div>
+
+<div class="panel">
+ <div class="controls">
+  <button id="start">شروع دوربین و مدل</button>
+  <button id="stop" class="secondary" disabled>توقف دوربین</button>
+  <button id="calibrate" class="secondary" disabled>تنظیم صفر در حالت صاف</button>
+  <button id="record" disabled>شروع ثبت داده</button>
+  <button id="finish" class="secondary" disabled>پایان ثبت</button>
+  <button id="download" class="secondary" disabled>دریافت فایل CSV</button>
+ </div>
+ <p class="note">روش استفاده: دوربین را روشن کنید؛ در حالت ایستاده صاف، «تنظیم صفر» را بزنید. سپس حرکت خم‌شدن را انجام دهید و «شروع ثبت داده» را بزنید. پس از پایان، ثبت را متوقف و فایل CSV را دریافت کنید.</p>
+</div>
+
+<div class="panel">
+ <b>آخرین داده‌ها</b>
+ <p class="muted">زمان از شروع ثبت، زاویه نسبت به عمود، زاویه نسبت به وضعیت پایه و کیفیت تشخیص شانه/لگن</p>
+ <div style="overflow:auto;max-height:220px">
+ <table><thead><tr><th>زمان (ثانیه)</th><th>زاویه (درجه)</th><th>تغییر از پایه (درجه)</th><th>کیفیت</th></tr></thead><tbody id="rows"><tr><td colspan="4">هنوز داده‌ای ثبت نشده است.</td></tr></tbody></table>
+ </div>
+</div>
+<p class="note">محدودیت علمی: این خروجی «زاویه تنه» بر اساس نقاط شانه و لگن MediaPipe است و اندازه‌گیری اختصاصی فلکشن کمری نیست. برای استفاده پژوهشی یا بالینی باید با روش مرجع اعتبارسنجی شود. ویدئو در همین مرورگر پردازش می‌شود؛ این صفحه ویدئو را به سرور ارسال نمی‌کند.</p>
+
+<script type="module">
+import { FilesetResolver, PoseLandmarker, DrawingUtils } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const video=document.getElementById('video'), canvas=document.getElementById('overlay'), ctx=canvas.getContext('2d');
+const statusEl=document.getElementById('status'), angleEl=document.getElementById('angle'), qualityEl=document.getElementById('quality');
+const startBtn=document.getElementById('start'), stopBtn=document.getElementById('stop'), calBtn=document.getElementById('calibrate'), recBtn=document.getElementById('record'), finishBtn=document.getElementById('finish'), dlBtn=document.getElementById('download'), rowsEl=document.getElementById('rows');
+let landmarker=null, stream=null, raf=0, lastTime=-1, baseline=null, recording=false, recordStart=0, data=[];
+const fmt=n=>Number(n).toFixed(1);
+function setStatus(s){statusEl.textContent=s}
+function angleFromVertical(a,b){
+  const dx=b.x-a.x, dy=a.y-b.y;
+  return Math.atan2(Math.abs(dx),Math.abs(dy))*180/Math.PI;
+}
+function updateTable(){
+ rowsEl.innerHTML='';
+ const recent=data.slice(-8).reverse();
+ if(!recent.length){rowsEl.innerHTML='<tr><td colspan="4">هنوز داده‌ای ثبت نشده است.</td></tr>';return}
+ for(const d of recent){
+  const tr=document.createElement('tr');
+  [fmt(d.time_s),fmt(d.angle_deg),d.change_deg===null?'—':fmt(d.change_deg),fmt(d.quality)].forEach(v=>{const td=document.createElement('td');td.textContent=v;tr.appendChild(td)});
+  rowsEl.appendChild(tr);
+ }
+}
+async function init(){
+ startBtn.disabled=true; setStatus('در حال بارگذاری مدل MediaPipe…');
+ try{
+  const vision=await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+  landmarker=await PoseLandmarker.createFromOptions(vision,{
+   baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',delegate:'GPU'},
+   runningMode:'VIDEO',numPoses:1,minPoseDetectionConfidence:0.5,minPosePresenceConfidence:0.5,minTrackingConfidence:0.5
+  });
+  stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}}});
+  video.srcObject=stream; await video.play();
+  canvas.width=video.videoWidth;canvas.height=video.videoHeight;
+  stopBtn.disabled=false;calBtn.disabled=false;recBtn.disabled=false;
+  setStatus('دوربین و مدل فعال‌اند. در حالت صاف، صفر را تنظیم کنید.');
+  loop();
+ }catch(e){
+  console.error(e);setStatus('خطا در راه‌اندازی: '+(e.message||e)+' — صفحه باید با HTTPS باز شود و اجازه دوربین داده شود.');
+  startBtn.disabled=false;
+ }
+}
+function loop(){
+ if(!landmarker||video.readyState<2){raf=requestAnimationFrame(loop);return}
+ if(video.currentTime!==lastTime){
+  lastTime=video.currentTime;
+  const result=landmarker.detectForVideo(video,performance.now());
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  if(result.landmarks?.length){
+   const lm=result.landmarks[0], draw=new DrawingUtils(ctx);
+   draw.drawConnectors(lm,PoseLandmarker.POSE_CONNECTIONS,{color:'#39e6a5',lineWidth:3});
+   draw.drawLandmarks(lm,{color:'#ffffff',lineWidth:1,radius:3});
+   // MediaPipe indices: left/right shoulder 11/12, left/right hip 23/24
+   const ids=[11,12,23,24], q=Math.min(...ids.map(i=>lm[i]?.visibility??lm[i]?.presence??0));
+   const shoulder={x:(lm[11].x+lm[12].x)/2,y:(lm[11].y+lm[12].y)/2};
+   const hip={x:(lm[23].x+lm[24].x)/2,y:(lm[23].y+lm[24].y)/2};
+   const raw=angleFromVertical(shoulder,hip);
+   // Draw shoulder-to-hip segment on mirrored canvas
+   ctx.strokeStyle='#ffdf55';ctx.lineWidth=5;ctx.beginPath();
+   ctx.moveTo(shoulder.x*canvas.width,shoulder.y*canvas.height);ctx.lineTo(hip.x*canvas.width,hip.y*canvas.height);ctx.stroke();
+   const current=raw;
+   angleEl.textContent=fmt(current);
+   qualityEl.textContent='زاویه نسبت به عمود | کیفیت تقریبی نقاط: '+fmt(q);
+   if(recording){
+    const t=(performance.now()-recordStart)/1000;
+    data.push({time_s:t,angle_deg:current,change_deg:baseline===null?null:current-baseline,quality:q});
+    if(data.length%5===0)updateTable();
+   }
+  }else{angleEl.textContent='—';qualityEl.textContent='بدن شناسایی نشد؛ تمام بدن را در کادر قرار دهید.'}
+ }
+ raf=requestAnimationFrame(loop);
+}
+startBtn.addEventListener('click',init);
+stopBtn.addEventListener('click',()=>{
+ cancelAnimationFrame(raf);if(stream)stream.getTracks().forEach(t=>t.stop());stream=null;video.srcObject=null;
+ if(landmarker){landmarker.close();landmarker=null}
+ stopBtn.disabled=true;startBtn.disabled=false;calBtn.disabled=true;recBtn.disabled=true;finishBtn.disabled=true;
+ setStatus('دوربین متوقف شد.');
+});
+calBtn.addEventListener('click',()=>{
+ const v=parseFloat(angleEl.textContent);if(Number.isFinite(v)){baseline=v;setStatus('وضعیت فعلی به‌عنوان خط پایه ثبت شد: '+fmt(v)+' درجه.')}
+});
+recBtn.addEventListener('click',()=>{
+ data=[];recordStart=performance.now();recording=true;recBtn.disabled=true;finishBtn.disabled=false;dlBtn.disabled=true;updateTable();setStatus('ثبت داده‌ها شروع شد.');
+});
+finishBtn.addEventListener('click',()=>{
+ recording=false;recBtn.disabled=false;finishBtn.disabled=true;dlBtn.disabled=data.length===0;updateTable();setStatus('ثبت پایان یافت. تعداد نمونه‌ها: '+data.length);
+});
+dlBtn.addEventListener('click',()=>{
+ const header='time_s,angle_deg,change_from_baseline_deg,landmark_quality';
+ const lines=data.map(d=>[d.time_s,d.angle_deg,d.change_deg??'',d.quality].join(','));
+ const blob=new Blob(['\ufeff'+[header,...lines].join('\n')],{type:'text/csv;charset=utf-8;'});
+ const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='trunk_angle_trial.csv';a.click();URL.revokeObjectURL(url);
+});
+</script>
+</body>
+</html>
